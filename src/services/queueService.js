@@ -1,15 +1,25 @@
-import { 
-  getDatabase, 
-  ref, 
-  push, 
-  get, 
+import {
+  getDatabase,
+  ref,
+  push,
+  get,
+  set,
   update,
   remove,
-  onValue
+  onValue,
 } from "firebase/database";
 import app from "../firebaseConfig";
 
 const db = getDatabase(app);
+
+// Database structure:
+// queues/
+//   waiting/        (active customers waiting)
+//   serving/        (currently being served)
+//   archived/       (completed + skipped)
+//   stats/
+//     daily/        (cached daily statistics)
+//     monthly/      (cached monthly statistics)
 
 // ==================== CUSTOMER FUNCTIONS ====================
 
@@ -28,11 +38,10 @@ export const joinQueue = async (name, partySize, phone) => {
 
     const position = await getNextPosition();
 
-    const newQueueRef = push(ref(db, "queues"), {
+    const newQueueRef = push(ref(db, "queues/waiting"), {
       name: name.trim(),
       partySize: parseInt(partySize),
       phone: phone.trim(),
-      status: "waiting",
       position: position,
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -52,8 +61,14 @@ export const joinQueue = async (name, partySize, phone) => {
  */
 export const getQueueStatus = async (queueId) => {
   try {
-    const docSnap = await get(ref(db, `queues/${queueId}`));
-    
+    // Search in waiting first
+    let docSnap = await get(ref(db, `queues/waiting/${queueId}`));
+
+    if (!docSnap.exists()) {
+      // Search in serving
+      docSnap = await get(ref(db, `queues/serving/${queueId}`));
+    }
+
     if (!docSnap.exists()) {
       throw new Error("Queue entry not found");
     }
@@ -82,22 +97,39 @@ export const getQueueStatus = async (queueId) => {
  */
 export const subscribeToQueueStatus = (queueId, callback) => {
   try {
-    const unsubscribe = onValue(
-      ref(db, `queues/${queueId}`),
+    // Subscribe to waiting path
+    const unsubscribeWaiting = onValue(
+      ref(db, `queues/waiting/${queueId}`),
       (snapshot) => {
         if (snapshot.exists()) {
           callback({
             id: queueId,
+            status: "waiting",
             ...snapshot.val(),
           });
         }
-      },
-      (error) => {
-        console.error("Error subscribing to queue status:", error);
       }
     );
 
-    return unsubscribe;
+    // Subscribe to serving path
+    const unsubscribeServing = onValue(
+      ref(db, `queues/serving/${queueId}`),
+      (snapshot) => {
+        if (snapshot.exists()) {
+          callback({
+            id: queueId,
+            status: "serving",
+            ...snapshot.val(),
+          });
+        }
+      }
+    );
+
+    // Return combined unsubscribe function
+    return () => {
+      unsubscribeWaiting();
+      unsubscribeServing();
+    };
   } catch (error) {
     console.error("Error setting up subscription:", error);
     throw error;
@@ -113,23 +145,34 @@ export const subscribeToQueueStatus = (queueId, callback) => {
  */
 export const subscribeToQueueList = (callback) => {
   try {
-    const unsubscribe = onValue(
-      ref(db, "queues"),
+    const unsubscribeWaiting = onValue(
+      ref(db, "queues/waiting"),
       (snapshot) => {
+        const waitingQueues = [];
         if (snapshot.exists()) {
           const data = snapshot.val();
-          const queueList = Object.entries(data)
-            .map(([id, value]) => ({
-              id,
-              ...value,
-            }))
-            .filter(q => q.status === "waiting" || q.status === "serving")
-            .sort((a, b) => a.position - b.position);
-          
-          callback(queueList);
-        } else {
-          callback([]);
+          Object.entries(data).forEach(([id, value]) => {
+            waitingQueues.push({ id, status: "waiting", ...value });
+          });
         }
+
+        // Get serving queues too
+        onValue(ref(db, "queues/serving"), (servingSnapshot) => {
+          const servingQueues = [];
+          if (servingSnapshot.exists()) {
+            const data = servingSnapshot.val();
+            Object.entries(data).forEach(([id, value]) => {
+              servingQueues.push({ id, status: "serving", ...value });
+            });
+          }
+
+          // Combine and sort
+          const allQueues = [...waitingQueues, ...servingQueues].sort(
+            (a, b) => a.position - b.position
+          );
+
+          callback(allQueues);
+        });
       },
       (error) => {
         console.error("Error subscribing to queue list:", error);
@@ -137,7 +180,7 @@ export const subscribeToQueueList = (callback) => {
       }
     );
 
-    return unsubscribe;
+    return unsubscribeWaiting;
   } catch (error) {
     console.error("Error setting up queue list subscription:", error);
     throw error;
@@ -145,30 +188,80 @@ export const subscribeToQueueList = (callback) => {
 };
 
 /**
- * Update queue status (waiting, serving, completed, skipped)
+ * Update queue status (move between waiting, serving, archived)
  * @param {string} queueId - Queue document ID
- * @param {string} newStatus - New status
+ * @param {string} newStatus - New status (serving, completed, skipped)
  * @returns {Promise<void>}
  */
 export const updateQueueStatus = async (queueId, newStatus) => {
   try {
-    const validStatuses = ["waiting", "serving", "completed", "skipped"];
+    const validStatuses = ["serving", "completed", "skipped"];
     if (!validStatuses.includes(newStatus)) {
       throw new Error(`Invalid status: ${newStatus}`);
     }
 
-    const updateData = {
-      status: newStatus,
-      updatedAt: Date.now(),
-    };
+    // First, find where the queue currently is
+    let queueData = null;
+    let currentLocation = null; // 'waiting' or 'serving'
 
-    if (newStatus === "serving") {
-      updateData.servedAt = Date.now();
-    } else if (newStatus === "completed" || newStatus === "skipped") {
-      updateData.completedAt = Date.now();
+    // Check in waiting first
+    const waitingSnap = await get(ref(db, `queues/waiting/${queueId}`));
+    if (waitingSnap.exists()) {
+      queueData = waitingSnap.val();
+      currentLocation = "waiting";
+    } else {
+      // Check in serving
+      const servingSnap = await get(ref(db, `queues/serving/${queueId}`));
+      if (servingSnap.exists()) {
+        queueData = servingSnap.val();
+        currentLocation = "serving";
+      }
     }
 
-    await update(ref(db, `queues/${queueId}`), updateData);
+    if (!queueData) {
+      throw new Error("Queue entry not found in waiting or serving");
+    }
+
+    // Handle transition to serving
+    if (newStatus === "serving") {
+      if (currentLocation === "waiting") {
+        // Move from waiting to serving
+        await remove(ref(db, `queues/waiting/${queueId}`));
+        await set(ref(db, `queues/serving/${queueId}`), {
+          ...queueData,
+          servedAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      }
+    }
+    // Handle transition to completed or skipped
+    else if (newStatus === "completed" || newStatus === "skipped") {
+      // Calculate wait time
+      let waitTime = 0;
+      if (queueData.createdAt && queueData.servedAt) {
+        waitTime = Math.round(
+          (queueData.servedAt - queueData.createdAt) / 1000 / 60
+        );
+      }
+
+      // Remove from current location (waiting or serving)
+      if (currentLocation === "waiting") {
+        await remove(ref(db, `queues/waiting/${queueId}`));
+      } else if (currentLocation === "serving") {
+        await remove(ref(db, `queues/serving/${queueId}`));
+      }
+
+      // Add to archived
+      await set(ref(db, `queues/archived/${queueId}`), {
+        ...queueData,
+        status: newStatus,
+        completedAt: Date.now(),
+        waitTime: waitTime,
+      });
+
+      // Update daily stats
+      await updateDailyStats(newStatus, queueData.partySize || 1, waitTime);
+    }
   } catch (error) {
     console.error("Error updating queue status:", error);
     throw error;
@@ -176,25 +269,25 @@ export const updateQueueStatus = async (queueId, newStatus) => {
 };
 
 /**
- * Reorder queues (swap positions)
+ * Reorder queues (swap positions) - only for waiting queue
  * @param {string} queueId1 - First queue ID
  * @param {string} queueId2 - Second queue ID
  * @returns {Promise<void>}
  */
 export const reorderQueues = async (queueId1, queueId2) => {
   try {
-    const doc1 = await get(ref(db, `queues/${queueId1}`));
-    const doc2 = await get(ref(db, `queues/${queueId2}`));
+    const doc1 = await get(ref(db, `queues/waiting/${queueId1}`));
+    const doc2 = await get(ref(db, `queues/waiting/${queueId2}`));
 
     if (!doc1.exists() || !doc2.exists()) {
-      throw new Error("One or both queue entries not found");
+      throw new Error("One or both queue entries not found in waiting queue");
     }
 
     const pos1 = doc1.val().position;
     const pos2 = doc2.val().position;
 
-    await update(ref(db, `queues/${queueId1}`), { position: pos2 });
-    await update(ref(db, `queues/${queueId2}`), { position: pos1 });
+    await update(ref(db, `queues/waiting/${queueId1}`), { position: pos2 });
+    await update(ref(db, `queues/waiting/${queueId2}`), { position: pos1 });
   } catch (error) {
     console.error("Error reordering queues:", error);
     throw error;
@@ -202,56 +295,114 @@ export const reorderQueues = async (queueId1, queueId2) => {
 };
 
 /**
- * Get daily statistics
+ * Get daily statistics from cached data
  * @returns {Promise<object>} Statistics
  */
 export const getDailyStats = async () => {
   try {
-    const snapshot = await get(ref(db, "queues"));
-    
-    if (!snapshot.exists()) {
-      return { totalServed: 0, totalPeople: 0, avgWaitTime: 0 };
+    const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+    const statsSnap = await get(ref(db, `queues/stats/daily/${today}`));
+
+    if (statsSnap.exists()) {
+      return statsSnap.val();
     }
 
-    const data = snapshot.val();
-    const completed = Object.values(data).filter(q => q.status === "completed");
-
-    let totalPeople = 0;
-    let totalWaitTime = 0;
-
-    completed.forEach(q => {
-      totalPeople += q.partySize || 1;
-      if (q.servedAt && q.createdAt) {
-        const waitTime = (q.servedAt - q.createdAt) / 1000 / 60; // in minutes
-        totalWaitTime += waitTime;
-      }
-    });
-
-    const avgWaitTime = completed.length > 0
-      ? Math.round(totalWaitTime / completed.length)
-      : 0;
-
+    // If no stats yet, return zeros
     return {
-      totalServed: completed.length,
-      totalPeople,
-      avgWaitTime,
-      peakHour: "N/A",
+      totalServed: 0,
+      totalPeople: 0,
+      avgWaitTime: 0,
+      lastUpdated: Date.now(),
     };
   } catch (error) {
     console.error("Error getting daily stats:", error);
-    throw error;
+    return {
+      totalServed: 0,
+      totalPeople: 0,
+      avgWaitTime: 0,
+    };
   }
 };
 
 /**
- * Get queue completion history
+ * Update daily and monthly statistics
+ * @private
+ * @param {string} status - completed or skipped
+ * @param {number} partySize - Number of people
+ * @param {number} waitTime - Wait time in minutes
+ */
+const updateDailyStats = async (status, partySize, waitTime) => {
+  try {
+    const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+    const month = today.substring(0, 7); // YYYY-MM
+
+    const statsRef = ref(db, `queues/stats/daily/${today}`);
+    const statsSnap = await get(statsRef);
+
+    let currentStats = {
+      totalServed: 0,
+      totalPeople: 0,
+      totalWaitTime: 0,
+      lastUpdated: Date.now(),
+    };
+
+    if (statsSnap.exists()) {
+      currentStats = statsSnap.val();
+    }
+
+    // Only count completed for stats
+    if (status === "completed") {
+      currentStats.totalServed = (currentStats.totalServed || 0) + 1;
+      currentStats.totalPeople = (currentStats.totalPeople || 0) + partySize;
+      currentStats.totalWaitTime = (currentStats.totalWaitTime || 0) + waitTime;
+      currentStats.avgWaitTime = Math.round(
+        currentStats.totalWaitTime / currentStats.totalServed
+      );
+    }
+
+    currentStats.lastUpdated = Date.now();
+
+    // Update daily stats
+    await update(ref(db, `queues/stats/daily/${today}`), currentStats);
+
+    // Update monthly stats (aggregate)
+    if (status === "completed") {
+      const monthlyRef = ref(db, `queues/stats/monthly/${month}`);
+      const monthlySnap = await get(monthlyRef);
+
+      let monthlyStats = {
+        totalServed: 0,
+        totalPeople: 0,
+        totalWaitTime: 0,
+      };
+
+      if (monthlySnap.exists()) {
+        monthlyStats = monthlySnap.val();
+      }
+
+      monthlyStats.totalServed = (monthlyStats.totalServed || 0) + 1;
+      monthlyStats.totalPeople = (monthlyStats.totalPeople || 0) + partySize;
+      monthlyStats.totalWaitTime = (monthlyStats.totalWaitTime || 0) + waitTime;
+      monthlyStats.avgWaitTime = Math.round(
+        monthlyStats.totalWaitTime / monthlyStats.totalServed
+      );
+
+      await update(ref(db, `queues/stats/monthly/${month}`), monthlyStats);
+    }
+  } catch (error) {
+    console.error("Error updating stats:", error);
+  }
+};
+
+/**
+ * Get queue completion history from archived
  * @param {number} limit - Number of records to fetch
  * @returns {Promise<array>} Completed queues
  */
 export const getCompletionHistory = async (limit = 20) => {
   try {
-    const snapshot = await get(ref(db, "queues"));
-    
+    const snapshot = await get(ref(db, "queues/archived"));
+
     if (!snapshot.exists()) {
       return [];
     }
@@ -259,7 +410,6 @@ export const getCompletionHistory = async (limit = 20) => {
     const data = snapshot.val();
     const completed = Object.entries(data)
       .map(([id, value]) => ({ id, ...value }))
-      .filter(q => q.status === "completed" || q.status === "skipped")
       .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0))
       .slice(0, limit);
 
@@ -273,21 +423,19 @@ export const getCompletionHistory = async (limit = 20) => {
 // ==================== HELPER FUNCTIONS ====================
 
 /**
- * Get next available position
+ * Get next available position (from waiting queue only)
  * @returns {Promise<number>} Next position number
  */
 const getNextPosition = async () => {
   try {
-    const snapshot = await get(ref(db, "queues"));
-    
+    const snapshot = await get(ref(db, "queues/waiting"));
+
     if (!snapshot.exists()) {
       return 1;
     }
 
     const data = snapshot.val();
-    const positions = Object.values(data)
-      .filter(q => q.status === "waiting")
-      .map(q => q.position || 0);
+    const positions = Object.values(data).map((q) => q.position || 0);
 
     return positions.length > 0 ? Math.max(...positions) + 1 : 1;
   } catch (error) {
@@ -303,8 +451,8 @@ const getNextPosition = async () => {
  */
 const getQueuePosition = async (queueId) => {
   try {
-    const snapshot = await get(ref(db, "queues"));
-    
+    const snapshot = await get(ref(db, "queues/waiting"));
+
     if (!snapshot.exists()) {
       return 0;
     }
@@ -312,10 +460,9 @@ const getQueuePosition = async (queueId) => {
     const data = snapshot.val();
     const waitingQueues = Object.entries(data)
       .map(([id, value]) => ({ id, ...value }))
-      .filter(q => q.status === "waiting")
       .sort((a, b) => a.position - b.position);
 
-    const position = waitingQueues.findIndex(q => q.id === queueId) + 1;
+    const position = waitingQueues.findIndex((q) => q.id === queueId) + 1;
     return position > 0 ? position : 0;
   } catch (error) {
     console.error("Error getting queue position:", error);
@@ -324,7 +471,7 @@ const getQueuePosition = async (queueId) => {
 };
 
 /**
- * Calculate estimated wait time based on average serving time
+ * Calculate estimated wait time based on waiting queue
  * @returns {Promise<number>} Estimated wait time in minutes
  */
 const getEstimatedWaitTime = async () => {
@@ -334,13 +481,12 @@ const getEstimatedWaitTime = async () => {
       ? settingsSnapshot.val().averageServingTime || 5
       : 5;
 
-    const queuesSnapshot = await get(ref(db, "queues"));
-    
-    if (queuesSnapshot.exists()) {
-      const data = queuesSnapshot.val();
-      const peopleAhead = Object.values(data)
-        .filter(q => q.status === "waiting").length;
-      
+    const waitingSnapshot = await get(ref(db, "queues/waiting"));
+
+    if (waitingSnapshot.exists()) {
+      const data = waitingSnapshot.val();
+      const peopleAhead = Object.values(data).length;
+
       return peopleAhead * avgServingTime;
     }
 
@@ -352,13 +498,17 @@ const getEstimatedWaitTime = async () => {
 };
 
 /**
- * Delete a queue entry
+ * Delete a queue entry (from waiting or serving)
  * @param {string} queueId - Queue document ID
  * @returns {Promise<void>}
  */
 export const deleteQueueEntry = async (queueId) => {
   try {
-    await remove(ref(db, `queues/${queueId}`));
+    // Try to remove from waiting first
+    await remove(ref(db, `queues/waiting/${queueId}`));
+
+    // Also try to remove from serving in case it was moved
+    await remove(ref(db, `queues/serving/${queueId}`));
   } catch (error) {
     console.error("Error deleting queue entry:", error);
     throw error;
@@ -366,7 +516,7 @@ export const deleteQueueEntry = async (queueId) => {
 };
 
 /**
- * Search for queue by phone number
+ * Search for queue by phone number (only in waiting/serving)
  * @param {string} phone - Phone number to search
  * @returns {Promise<object>} Queue data with ID or null if not found
  */
@@ -376,34 +526,65 @@ export const searchQueueByPhone = async (phone) => {
       throw new Error("Please enter a phone number");
     }
 
-    const queuesSnapshot = await get(ref(db, "queues"));
-    
-    if (!queuesSnapshot.exists()) {
-      throw new Error("No queues found");
+    const cleanSearchPhone = phone.trim().toLowerCase();
+
+    // Search in waiting queue
+    const waitingSnapshot = await get(ref(db, "queues/waiting"));
+
+    if (waitingSnapshot.exists()) {
+      const data = waitingSnapshot.val();
+
+      for (const [queueId, queueData] of Object.entries(data)) {
+        if (
+          !queueData ||
+          !queueData.phone ||
+          typeof queueData.phone !== "string"
+        ) {
+          continue;
+        }
+
+        const queuePhone = queueData.phone.trim().toLowerCase();
+
+        if (
+          queuePhone === cleanSearchPhone ||
+          queuePhone.slice(-7) === cleanSearchPhone.slice(-7)
+        ) {
+          return {
+            id: queueId,
+            status: "waiting",
+            ...queueData,
+          };
+        }
+      }
     }
 
-    const data = queuesSnapshot.val();
-    
-    // Search for matching phone number (case insensitive, trim whitespace)
-    const cleanSearchPhone = phone.trim().toLowerCase();
-    
-    for (const [queueId, queueData] of Object.entries(data)) {
-      // Check if phone exists and is a string before processing
-      if (!queueData || !queueData.phone || typeof queueData.phone !== 'string') {
-        continue; // Skip this entry if phone is invalid
-      }
+    // Search in serving queue
+    const servingSnapshot = await get(ref(db, "queues/serving"));
 
-      const queuePhone = queueData.phone.trim().toLowerCase();
-      
-      // Exact match or partial match (last 7 digits)
-      if (
-        queuePhone === cleanSearchPhone ||
-        queuePhone.slice(-7) === cleanSearchPhone.slice(-7)
-      ) {
-        return {
-          id: queueId,
-          ...queueData,
-        };
+    if (servingSnapshot.exists()) {
+      const data = servingSnapshot.val();
+
+      for (const [queueId, queueData] of Object.entries(data)) {
+        if (
+          !queueData ||
+          !queueData.phone ||
+          typeof queueData.phone !== "string"
+        ) {
+          continue;
+        }
+
+        const queuePhone = queueData.phone.trim().toLowerCase();
+
+        if (
+          queuePhone === cleanSearchPhone ||
+          queuePhone.slice(-7) === cleanSearchPhone.slice(-7)
+        ) {
+          return {
+            id: queueId,
+            status: "serving",
+            ...queueData,
+          };
+        }
       }
     }
 
