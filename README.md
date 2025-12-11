@@ -1,5 +1,7 @@
 # 🍽️ Queue Management System
 
+Link: [queue-management web application](https://natchanonmaneerat.github.io/queue-management)
+
 A real-time web application for restaurants to manage customer queues efficiently. Customers can join queues, track their position in real-time, and receive notifications. Admins can monitor queues, update status, and view statistics.
 
 ## ✨ Key Features
