@@ -406,13 +406,13 @@ npm install
 ### Step 2: Configure Firebase
 Your `.env` file is already configured with these variables:
 ```
-VITE_FIREBASE_API_KEY=AIzaSyCgDTv6x2GqY9onrUi-Try8g6TBwcjiT_Y
-VITE_FIREBASE_AUTH_DOMAIN=queue-management-b2104.firebaseapp.com
-VITE_FIREBASE_DATABASE_URL=https://queue-management-b2104-default-rtdb.asia-southeast1.firebasedatabase.app
-VITE_FIREBASE_PROJECT_ID=queue-management-b2104
-VITE_FIREBASE_STORAGE_BUCKET=queue-management-b2104.firebasestorage.app
-VITE_FIREBASE_MESSAGING_SENDER_ID=228245548904
-VITE_FIREBASE_APP_ID=1:228245548904:web:a58897c25658915fccb0dd
+VITE_FIREBASE_API_KEY=your_api_key_here
+VITE_FIREBASE_AUTH_DOMAIN=your_project.firebaseapp.com
+VITE_FIREBASE_DATABASE_URL=https://your_project.firebaseio.com
+VITE_FIREBASE_PROJECT_ID=your_project_id
+VITE_FIREBASE_STORAGE_BUCKET=your_project.appspot.com
+VITE_FIREBASE_MESSAGING_SENDER_ID=your_messaging_sender_id
+VITE_FIREBASE_APP_ID=your_app_id
 ```
 
 ### Step 3: Run Development Server
